@@ -552,6 +552,11 @@ class TimeWiseCVAE(tf.keras.Model):
             0.5,
         )
 
+        # 振幅損失: 合成音声のRMSが低すぎる場合にペナルティを与える
+        # DecayやSustainが0に収束するショートカットを防ぐ
+        audio_rms = tf.sqrt(tf.reduce_mean(tf.square(x_hat_sq)) + 1e-8)
+        amp_l = s(tf.maximum(0.0, 0.2 - audio_rms))
+
         kl_w = self.compute_kl_weight()
         loss = (
             recon * 5.0
@@ -559,11 +564,12 @@ class TimeWiseCVAE(tf.keras.Model):
             + mel_l * 4.0
             + hf_l * 2.0
             + flux_l * 2.0
+            + amp_l * 5.0
             + kl * kl_w
         )
         loss = s(loss, 1000.0)
 
-        return loss, recon, stft_l, mel_l, hf_l, flux_l, kl, kl_w, z_mean
+        return loss, recon, stft_l, mel_l, hf_l, flux_l, amp_l, kl, kl_w, z_mean
 
     # ----------------------------------------------------------
     # train_step
@@ -572,7 +578,7 @@ class TimeWiseCVAE(tf.keras.Model):
         (audio, pitch, timbre_id), _ = data
 
         with tf.GradientTape() as tape:
-            loss, recon, stft_l, mel_l, hf_l, flux_l, kl, kl_w, z_mean = (
+            loss, recon, stft_l, mel_l, hf_l, flux_l, amp_l, kl, kl_w, z_mean = (
                 self._compute_losses(audio, pitch, timbre_id, training=True)
             )
 
@@ -611,6 +617,7 @@ class TimeWiseCVAE(tf.keras.Model):
             "mel": mel_l,
             "high_freq": hf_l,
             "spectral_flux": flux_l,
+            "amp": amp_l,
             "kl": kl,
             "kl_weight": kl_w,
             "z_std_ema": self.z_std_ema,
@@ -622,7 +629,7 @@ class TimeWiseCVAE(tf.keras.Model):
     # ----------------------------------------------------------
     def test_step(self, data):
         (audio, pitch, timbre_id), _ = data
-        loss, recon, stft_l, mel_l, hf_l, flux_l, kl, kl_w, _ = (
+        loss, recon, stft_l, mel_l, hf_l, flux_l, amp_l, kl, kl_w, _ = (
             self._compute_losses(audio, pitch, timbre_id, training=False)
         )
         return {
@@ -632,6 +639,7 @@ class TimeWiseCVAE(tf.keras.Model):
             "mel": mel_l,
             "high_freq": hf_l,
             "spectral_flux": flux_l,
+            "amp": amp_l,
             "kl": kl,
             "kl_weight": kl_w,
         }

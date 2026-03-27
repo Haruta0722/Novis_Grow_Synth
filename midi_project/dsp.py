@@ -483,7 +483,7 @@ def synthesize_numpy(
     # --- 4. Noise ---
     if params.noise_amount > 1e-4:
         noise = noise_generator_numpy(params.noise_amount, time_length, seed)
-        audio = audio + noise
+        audio = audio + noise * 0.1  # ノイズ実効量を1/10にスケール
 
     # --- 5. tanh クリッピング ---
     audio = np.tanh(audio).astype(np.float32)
