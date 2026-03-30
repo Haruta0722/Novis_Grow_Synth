@@ -175,8 +175,9 @@ def oscillator_numpy(
     delta_phase = 2.0 * np.pi * harm_freqs[None, :] / sr
     phase = np.cumsum(np.tile(delta_phase, (time_length, 1)), axis=0)
 
-    # 0.05 未満の倍音は無音とみなす
-    harmonic_amps = np.where(harmonic_amps < 0.05, 0.0, harmonic_amps)
+    # 極小の倍音のみ無音とみなす
+    # softmax均等分布では 1/32≈0.031 なので 0.05 は使えない
+    harmonic_amps = np.where(harmonic_amps < 0.001, 0.0, harmonic_amps)
 
     # 合成
     audio = (harmonic_amps[None, :] * np.sin(phase)).sum(axis=1)  # [time]
