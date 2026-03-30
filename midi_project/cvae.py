@@ -53,34 +53,6 @@ from dsp import (
 # ============================================================
 # 損失関数ユーティリティ
 # ============================================================
-def compute_spectral_flux_loss(
-    y_true, y_pred, frame_length=2048, hop_length=512
-):
-    def get_flux(audio):
-        mag = tf.abs(
-            tf.signal.stft(audio, frame_length, hop_length, frame_length)
-        )
-        diff = tf.maximum(mag[:, 1:, :] - mag[:, :-1, :], 0.0)
-        return tf.reduce_mean(diff, axis=-1)
-
-    return tf.reduce_mean(tf.abs(get_flux(y_true) - get_flux(y_pred)))
-
-
-def compute_high_freq_emphasis_loss(y_true, y_pred, sr=SR, cutoff_freq=2000.0):
-    stft_true = tf.signal.stft(y_true, 2048, 512, 2048)
-    stft_pred = tf.signal.stft(y_pred, 2048, 512, 2048)
-    mag_true = tf.abs(stft_true)
-    mag_pred = tf.abs(stft_pred)
-    num_bins = tf.shape(mag_true)[-1]
-    freq_bins = (
-        tf.cast(tf.range(num_bins), tf.float32)
-        * (sr / 2.0)
-        / tf.cast(num_bins, tf.float32)
-    )
-    weight = tf.reshape(
-        tf.sigmoid((freq_bins - cutoff_freq) / 500.0), [1, 1, -1]
-    )
-    return tf.reduce_mean(tf.square(mag_true - mag_pred) * (1.0 + weight * 5.0))
 
 
 # ============================================================
@@ -510,63 +482,84 @@ class TimeWiseCVAE(tf.keras.Model):
     # ----------------------------------------------------------
     # 音色別パラメータ補助損失
     # ----------------------------------------------------------
-    def _timbre_param_loss(self, p, timbre_id):
+    def _timbre_param_loss(self, p, timbre_id, x_hat_sq):
         """
-        各音色らしいパラメータ範囲に誘導するソフトペナルティ損失。
+        各音色らしいパラメータ範囲・振幅形状に誘導するソフトペナルティ損失。
 
         モデルが3音色を共通の「平均的なパラメータ」に収束させる問題を防ぐ。
         ターゲット範囲を外れた分だけペナルティを与える (hinge損失)。
 
-        Screech (id=0): ノイズ多め・高次倍音を豊富に
-        Acid    (id=1): レゾナンス高め
-        Pluck   (id=2): 短いDecay・低Sustain・高次倍音を抑え丸みを出す
+        時間的エネルギー比率 (decay_ratio = 前半1/4のRMS / 後半1/2のRMS):
+            Pluck   (id=2): ratio > 5   急速減衰 = 前半にエネルギー集中
+            Screech (id=0): ratio < 2   持続的ノイズ = 後半も音量を維持
+            Acid    (id=1): ratio < 2.5 持続的うねり = 後半も音量を維持
         """
         screech_mask = tf.cast(tf.equal(timbre_id, 0), tf.float32)  # [batch]
         acid_mask    = tf.cast(tf.equal(timbre_id, 1), tf.float32)
         pluck_mask   = tf.cast(tf.equal(timbre_id, 2), tf.float32)
 
-        # 高次倍音の平均 (上半分) を音色判定に使う [batch]
+        # 時間的エネルギー比率 [batch]
+        q    = TIME_LENGTH // 4
+        half = TIME_LENGTH // 2
+        early_rms = tf.sqrt(
+            tf.reduce_mean(tf.square(x_hat_sq[:, :q]),    axis=1) + 1e-8
+        )
+        late_rms = tf.sqrt(
+            tf.reduce_mean(tf.square(x_hat_sq[:, half:]), axis=1) + 1e-8
+        )
+        decay_ratio = early_rms / (late_rms + 1e-8)  # 大きい = 前半集中
+
+        # 高次倍音の平均 (上半分) [batch]
         high_harm = tf.reduce_mean(
             p["harmonic_amps"][:, NUM_HARMONICS // 2 :], axis=1
         )
 
         # --- Screech ---
-        # ノイズが少ないとペナルティ (noise_amount > 0.3 を促す)
         screech_noise_l = tf.reduce_mean(
             screech_mask * tf.maximum(0.0, 0.3 - p["noise_amount"])
         )
-        # 高次倍音が弱いとペナルティ (高次倍音平均 > 0.1 を促す)
         screech_harm_l = tf.reduce_mean(
             screech_mask * tf.maximum(0.0, 0.1 - high_harm)
         )
+        # 前半集中しすぎ = 持続性がない → ペナルティ (ratio < 2 を促す)
+        screech_temporal_l = tf.reduce_mean(
+            screech_mask * tf.maximum(0.0, decay_ratio - 2.0)
+        )
 
         # --- Acid ---
-        # レゾナンスが低いとペナルティ (resonance > 0.4 を促す)
         acid_res_l = tf.reduce_mean(
             acid_mask * tf.maximum(0.0, 0.4 - p["resonance"])
         )
+        # 前半集中しすぎ = うねりが途切れる → ペナルティ (ratio < 2.5 を促す)
+        acid_temporal_l = tf.reduce_mean(
+            acid_mask * tf.maximum(0.0, decay_ratio - 2.5)
+        )
 
         # --- Pluck ---
-        # decay が長すぎるとペナルティ (decay < 0.35 を促す)
         pluck_decay_l = tf.reduce_mean(
             pluck_mask * tf.maximum(0.0, p["decay"] - 0.35)
         )
-        # sustain が高すぎるとペナルティ (sustain < 0.3 を促す)
         pluck_sustain_l = tf.reduce_mean(
             pluck_mask * tf.maximum(0.0, p["sustain"] - 0.3)
         )
-        # 高次倍音が多すぎるとペナルティ (高次倍音平均 < 0.05 を促し丸みを出す)
         pluck_harm_l = tf.reduce_mean(
             pluck_mask * tf.maximum(0.0, high_harm - 0.05)
+        )
+        # 急速減衰が弱い = 後半も音が残る → ペナルティ (ratio > 5 を促す)
+        pluck_temporal_l = tf.reduce_mean(
+            pluck_mask * tf.maximum(0.0, 5.0 - decay_ratio)
         )
 
         return (
             screech_noise_l
             + screech_harm_l
+            + screech_temporal_l
             + acid_res_l
+            + acid_temporal_l
             + pluck_decay_l
             + pluck_sustain_l
             + pluck_harm_l
+            + pluck_temporal_l
         )
 
     # ----------------------------------------------------------
@@ -603,8 +596,6 @@ class TimeWiseCVAE(tf.keras.Model):
         stft_l, mel_l, _ = Loss(x_target, x_hat_sq, fft_size=2048, hop_size=512)
         stft_l = s(stft_l)
         mel_l = s(mel_l)
-        hf_l = s(compute_high_freq_emphasis_loss(x_target, x_hat_sq))
-        flux_l = s(compute_spectral_flux_loss(x_target, x_hat_sq), 0.1)
 
         kl_per_dim = -0.5 * (
             1.0 + z_logvar - tf.square(z_mean) - tf.exp(z_logvar)
@@ -630,22 +621,20 @@ class TimeWiseCVAE(tf.keras.Model):
         amp_l = s(tf.reduce_mean(tf.maximum(0.0, rms_target - audio_rms_per)))
 
         # 音色別パラメータ補助損失
-        timbre_l = s(self._timbre_param_loss(p, timbre_id))
+        timbre_l = s(self._timbre_param_loss(p, timbre_id, x_hat_sq))
 
         kl_w = self.compute_kl_weight()
         loss = (
             recon * 5.0
             + stft_l * 3.0
             + mel_l * 4.0
-            + hf_l * 2.0
-            + flux_l * 2.0
             + amp_l * 5.0
             + timbre_l * 3.0
             + kl * kl_w
         )
         loss = s(loss, 1000.0)
 
-        return loss, recon, stft_l, mel_l, hf_l, flux_l, amp_l, timbre_l, kl, kl_w, z_mean
+        return loss, recon, stft_l, mel_l, amp_l, timbre_l, kl, kl_w, z_mean
 
     # ----------------------------------------------------------
     # train_step
@@ -654,7 +643,7 @@ class TimeWiseCVAE(tf.keras.Model):
         (audio, pitch, timbre_id), _ = data
 
         with tf.GradientTape() as tape:
-            loss, recon, stft_l, mel_l, hf_l, flux_l, amp_l, timbre_l, kl, kl_w, z_mean = (
+            loss, recon, stft_l, mel_l, amp_l, timbre_l, kl, kl_w, z_mean = (
                 self._compute_losses(audio, pitch, timbre_id, training=True)
             )
 
@@ -691,8 +680,6 @@ class TimeWiseCVAE(tf.keras.Model):
             "best_recon": self.best_recon,
             "stft": stft_l,
             "mel": mel_l,
-            "high_freq": hf_l,
-            "spectral_flux": flux_l,
             "amp": amp_l,
             "timbre": timbre_l,
             "kl": kl,
