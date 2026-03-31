@@ -87,6 +87,11 @@ class DDSPParams:
     # Noise
     noise_amount: float = 0.0
 
+    # LFO (ピッチモジュレーション)  ― Acidのうねりに使用
+    # LFO (ピッチモジュレーション) ― Acidのうねりに使用
+    lfo_rate: float = 0.0   # 0~1 -> 0.1~10 Hz
+    lfo_depth: float = 0.0  # 0~1 -> 0~2 semitones
+
     def to_dict(self) -> dict:
         """マイコン送信用辞書に変換"""
         d = asdict(self)
@@ -110,6 +115,8 @@ class DDSPParams:
         self.cutoff = float(np.clip(self.cutoff, 0.0, 1.0))
         self.resonance = float(np.clip(self.resonance, 0.0, 1.0))
         self.noise_amount = float(np.clip(self.noise_amount, 0.0, 1.0))
+        self.lfo_rate = float(np.clip(self.lfo_rate, 0.0, 1.0))
+        self.lfo_depth = float(np.clip(self.lfo_depth, 0.0, 1.0))
         self.harmonic_amps = list(np.clip(self.harmonic_amps, 0.0, 1.0))
         return self
 
@@ -147,7 +154,7 @@ def cutoff_to_hz(cutoff: float, sr: int = SR) -> float:
 # モジュール1: Oscillator  加算合成シンセ
 # ============================================================
 def oscillator_numpy(
-    f0_hz: float,
+    f0_hz,              # float または [time_length] の配列 (LFO時)
     harmonic_amps: np.ndarray,  # [NUM_HARMONICS]  0〜1
     time_length: int = TIME_LENGTH,
     sr: int = SR,
@@ -155,9 +162,8 @@ def oscillator_numpy(
     """
     加算合成で倍音波形を生成する。
 
-    harmonic_amps の値が小さい倍音はほぼ無音になるよう、
-    振幅に対して二乗を適用して感度を高める。
-    これにより GUIで倍音を 0 に近づけると実際に無音になる。
+    f0_hz にスカラーを渡すと固定ピッチ、
+    [time_length] の配列を渡すと時変ピッチ (LFO等) になる。
 
     Returns:
         audio: [time_length]  float32
@@ -165,22 +171,31 @@ def oscillator_numpy(
     harmonic_amps = np.array(harmonic_amps, dtype=np.float32)
     harmonic_amps = np.clip(harmonic_amps, 0.0, 1.0)
     num_harmonics = len(harmonic_amps)
-
-    # 各倍音の周波数 [num_harmonics]
     harm_nums = np.arange(1, num_harmonics + 1, dtype=np.float32)
-    harm_freqs = f0_hz * harm_nums
-    harm_freqs = np.clip(harm_freqs, 0.0, sr / 2.0)
-
-    # サンプルごとの位相増分 → 累積位相 [time, H]
-    delta_phase = 2.0 * np.pi * harm_freqs[None, :] / sr
-    phase = np.cumsum(np.tile(delta_phase, (time_length, 1)), axis=0)
 
     # 極小の倍音のみ無音とみなす
     # softmax均等分布では 1/32≈0.031 なので 0.05 は使えない
     harmonic_amps = np.where(harmonic_amps < 0.001, 0.0, harmonic_amps)
 
-    # 合成
-    audio = (harmonic_amps[None, :] * np.sin(phase)).sum(axis=1)  # [time]
+    f0_arr = np.asarray(f0_hz, dtype=np.float32)
+    if f0_arr.ndim == 0:
+        # スカラー: 固定ピッチ [time, H]
+        harm_freqs = float(f0_hz) * harm_nums          # [H]
+        harm_freqs = np.clip(harm_freqs, 0.0, sr / 2.0)
+        delta_phase = 2.0 * np.pi * harm_freqs / sr   # [H]
+        phase = np.cumsum(
+            np.tile(delta_phase[None, :], (time_length, 1)), axis=0
+        )  # [T, H]
+    else:
+        # 配列: 時変ピッチ (LFO) [T, H]
+        f0_t = f0_arr[:time_length, None]              # [T, 1]
+        harm_freqs = np.clip(
+            f0_t * harm_nums[None, :], 0.0, sr / 2.0
+        )  # [T, H]
+        delta_phase = 2.0 * np.pi * harm_freqs / sr   # [T, H]
+        phase = np.cumsum(delta_phase, axis=0)         # [T, H]
+
+    audio = (harmonic_amps[None, :] * np.sin(phase)).sum(axis=1)
     return audio.astype(np.float32)
 
 
@@ -448,9 +463,22 @@ def synthesize_numpy(
     """
     params = params.clamp()
 
+    # --- LFO: 時変ピッチの計算 ---
+    # lfo_rate=0 or lfo_depth=0 のときは固定ピッチ (スカラー)
+    if params.lfo_rate > 1e-3 and params.lfo_depth > 1e-3:
+        t = np.arange(time_length, dtype=np.float32) / sr
+        rate_hz = params.lfo_rate * 9.9 + 0.1   # 0~1 → 0.1~10 Hz
+        depth_semi = params.lfo_depth * 2.0      # 0~1 → 0~2 semitones
+        lfo_sig = np.sin(2.0 * np.pi * rate_hz * t)
+        f0_input = params.f0_hz * (
+            2.0 ** (lfo_sig * depth_semi / 12.0)
+        )  # [time_length]
+    else:
+        f0_input = params.f0_hz  # スカラー
+
     # --- 1. Oscillator + Unison ---
     audio = unison_numpy(
-        f0_hz=params.f0_hz,
+        f0_hz=f0_input,
         harmonic_amps=np.array(params.harmonic_amps, dtype=np.float32),
         unison_voices=params.unison_voices,
         detune_cents=params.detune_cents,

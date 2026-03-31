@@ -328,6 +328,12 @@ class TimeWiseCVAE(tf.keras.Model):
         self.adsr = ADSRLayer()
         self.filter_l = FilterLayer()
 
+        # 補助分類器: 生成パラメータから音色IDを予測できるか強制する
+        # これにより Decoder が timbre_cond を無視できなくなる
+        self.timbre_classifier = tf.keras.layers.Dense(
+            TIMBRE_VOCAB, name="timbre_cls"
+        )
+
         self.steps_per_epoch = steps_per_epoch
         self.kl_warmup_epochs = 20
         self.kl_rampup_epochs = 80
@@ -623,6 +629,28 @@ class TimeWiseCVAE(tf.keras.Model):
         # 音色別パラメータ補助損失
         timbre_l = s(self._timbre_param_loss(p, timbre_id, x_hat_sq))
 
+        # 補助分類損失: 生成パラメータから音色IDを正しく予測できるか
+        # Decoder が timbre_cond を無視すると全音色で同じパラメータが出て
+        # この損失が大きくなるため、cond を活用するよう強制する
+        param_feat = tf.concat(
+            [
+                p["harmonic_amps"],          # [batch, NUM_HARMONICS] 倍音分布
+                p["noise_amount"][:, None],  # [batch, 1]
+                p["resonance"][:, None],     # [batch, 1]
+                p["decay"][:, None],         # [batch, 1]
+                p["sustain"][:, None],       # [batch, 1]
+            ],
+            axis=-1,
+        )
+        cls_logits = self.timbre_classifier(param_feat)  # [batch, TIMBRE_VOCAB]
+        cls_l = s(
+            tf.reduce_mean(
+                tf.keras.losses.sparse_categorical_crossentropy(
+                    timbre_id, cls_logits, from_logits=True
+                )
+            )
+        )
+
         kl_w = self.compute_kl_weight()
         loss = (
             recon * 5.0
@@ -630,11 +658,12 @@ class TimeWiseCVAE(tf.keras.Model):
             + mel_l * 4.0
             + amp_l * 5.0
             + timbre_l * 3.0
+            + cls_l * 2.0
             + kl * kl_w
         )
         loss = s(loss, 1000.0)
 
-        return loss, recon, stft_l, mel_l, amp_l, timbre_l, kl, kl_w, z_mean
+        return loss, recon, stft_l, mel_l, amp_l, timbre_l, cls_l, kl, kl_w, z_mean
 
     # ----------------------------------------------------------
     # train_step
@@ -643,7 +672,7 @@ class TimeWiseCVAE(tf.keras.Model):
         (audio, pitch, timbre_id), _ = data
 
         with tf.GradientTape() as tape:
-            loss, recon, stft_l, mel_l, amp_l, timbre_l, kl, kl_w, z_mean = (
+            loss, recon, stft_l, mel_l, amp_l, timbre_l, cls_l, kl, kl_w, z_mean = (
                 self._compute_losses(audio, pitch, timbre_id, training=True)
             )
 
@@ -682,6 +711,7 @@ class TimeWiseCVAE(tf.keras.Model):
             "mel": mel_l,
             "amp": amp_l,
             "timbre": timbre_l,
+            "cls": cls_l,
             "kl": kl,
             "kl_weight": kl_w,
             "z_std_ema": self.z_std_ema,
@@ -693,7 +723,7 @@ class TimeWiseCVAE(tf.keras.Model):
     # ----------------------------------------------------------
     def test_step(self, data):
         (audio, pitch, timbre_id), _ = data
-        loss, recon, stft_l, mel_l, hf_l, flux_l, amp_l, timbre_l, kl, kl_w, _ = (
+        loss, recon, stft_l, mel_l, amp_l, timbre_l, cls_l, kl, kl_w, _ = (
             self._compute_losses(audio, pitch, timbre_id, training=False)
         )
         return {
@@ -701,10 +731,9 @@ class TimeWiseCVAE(tf.keras.Model):
             "recon": recon,
             "stft": stft_l,
             "mel": mel_l,
-            "high_freq": hf_l,
-            "spectral_flux": flux_l,
             "amp": amp_l,
             "timbre": timbre_l,
+            "cls": cls_l,
             "kl": kl,
             "kl_weight": kl_w,
         }
